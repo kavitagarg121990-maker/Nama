@@ -15,6 +15,7 @@ import sqlite3
 import signal
 import sys
 import os
+import re
 import time
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -89,13 +90,15 @@ CONFIG = {
     # User-Agent string (from HAR)
     "user_agent": "Dalvik/2.1.0 (Linux; U; Android 14; SM-X910N Build/UQ1A.240205.07241537)",
 
-    # Available models (extracted from APK decompilation - with correct API IDs & fallbacks)
+    # Available models (extracted from APK decompilation - with correct API IDs, emojis & fallbacks)
     "models": {
         "1": {
             "id": "gpt-4o-mini",
             "aliases": ["gpt-4o-mini", "gpt-4o-mini-2024-07-18"],
             "name": "GPT-4o Mini",
-            "description": "Fast & cheap",
+            "emoji": "⚡",
+            "provider": "OpenAI",
+            "description": "Fast & lightweight everyday assistant",
             "tier": "FREE",
             "supports_system_role": True,
         },
@@ -103,7 +106,9 @@ CONFIG = {
             "id": "gpt-4o",
             "aliases": ["gpt-4o", "gpt-4o-2024-08-06", "chatgpt-4o-latest"],
             "name": "GPT-4o",
-            "description": "Most capable (Best)",
+            "emoji": "👑",
+            "provider": "OpenAI",
+            "description": "Most capable flagship model (Best)",
             "tier": "PRO",
             "supports_system_role": True,
         },
@@ -111,7 +116,9 @@ CONFIG = {
             "id": "o1",
             "aliases": ["o1", "o1-preview", "o1-2024-12-17"],
             "name": "GPT-01",
-            "description": "Reasoning model",
+            "emoji": "🧠",
+            "provider": "OpenAI",
+            "description": "Advanced step-by-step reasoning",
             "tier": "PRO",
             "supports_system_role": False,
         },
@@ -119,7 +126,9 @@ CONFIG = {
             "id": "o1-mini",
             "aliases": ["o1-mini", "o1-mini-2024-09-12"],
             "name": "GPT-01 Mini",
-            "description": "Fast reasoning",
+            "emoji": "⚙️",
+            "provider": "OpenAI",
+            "description": "Fast coding & logic reasoning",
             "tier": "PRO",
             "supports_system_role": False,
         },
@@ -127,7 +136,9 @@ CONFIG = {
             "id": "gemini-1.5-flash",
             "aliases": ["gemini-1.5-flash", "gemini-1.5-flash-latest", "gemini-1.5-pro", "gemini-pro"],
             "name": "Gemini 1.5 Flash",
-            "description": "Google fast",
+            "emoji": "✨",
+            "provider": "Google",
+            "description": "Ultra-fast multimodal intelligence",
             "tier": "PRO",
             "supports_system_role": False,
         },
@@ -135,7 +146,9 @@ CONFIG = {
             "id": "claude-3-5-haiku-latest",
             "aliases": ["claude-3-5-haiku-latest", "claude-3-5-haiku-20241022", "claude-3-haiku-20240307"],
             "name": "Claude 3.5 Haiku",
-            "description": "Anthropic fast",
+            "emoji": "🍃",
+            "provider": "Anthropic",
+            "description": "Instant, articulate & natural replies",
             "tier": "PRO",
             "supports_system_role": False,
         },
@@ -143,7 +156,9 @@ CONFIG = {
             "id": "claude-3-5-sonnet-latest",
             "aliases": ["claude-3-5-sonnet-latest", "claude-3-5-sonnet-20241022", "claude-3-5-sonnet-20240620"],
             "name": "Claude 3.5 Sonnet",
-            "description": "Anthropic smart",
+            "emoji": "🎭",
+            "provider": "Anthropic",
+            "description": "Elite coding, writing & nuance",
             "tier": "PRO",
             "supports_system_role": False,
         },
@@ -151,7 +166,9 @@ CONFIG = {
             "id": "deepseek-r1",
             "aliases": ["deepseek-r1", "deepseek-reasoner"],
             "name": "DeepSeek R1",
-            "description": "Deep reasoning",
+            "emoji": "🔬",
+            "provider": "DeepSeek",
+            "description": "Deep chain-of-thought math & code",
             "tier": "PRO",
             "supports_system_role": False,
         },
@@ -159,9 +176,40 @@ CONFIG = {
             "id": "deepseek-v3",
             "aliases": ["deepseek-v3", "deepseek-chat"],
             "name": "DeepSeek V3",
-            "description": "Deep fast",
+            "emoji": "🚀",
+            "provider": "DeepSeek",
+            "description": "High-speed general & technical chat",
             "tier": "PRO",
             "supports_system_role": True,
+        },
+    },
+
+    # Preset Personas for 1-Tap System Prompts
+    "personas": {
+        "default": {
+            "name": "Helpful Assistant",
+            "emoji": "🤖",
+            "prompt": DEFAULT_SYSTEM_PROMPT,
+        },
+        "coder": {
+            "name": "Senior Developer",
+            "emoji": "💻",
+            "prompt": "You are a world-class senior software engineer. Write clean, production-ready, well-commented code with concise explanations.",
+        },
+        "tutor": {
+            "name": "Study & Physics Tutor",
+            "emoji": "🎓",
+            "prompt": "You are an encouraging, crystal-clear academic and physics tutor. Explain concepts step-by-step with intuitive examples and clear formulas.",
+        },
+        "writer": {
+            "name": "Creative Writer",
+            "emoji": "✍️",
+            "prompt": "You are an elite creative writer and editor. Craft engaging, vivid, and polished prose tailored to the user's tone and audience.",
+        },
+        "concise": {
+            "name": "Ultra Concise",
+            "emoji": "⚡",
+            "prompt": "Give direct, bulleted, high-signal answers with zero fluff or filler.",
         },
     },
 
@@ -517,6 +565,32 @@ class ChatDatabase:
             cursor.execute("DELETE FROM messages WHERE id = ?", (message_row_id,))
             self.conn.commit()
 
+    def delete_last_assistant_message(self, chat_id):
+        """Delete the most recent assistant message in a chat (used for Regenerate)."""
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT id, role FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT 1",
+                (chat_id,)
+            )
+            row = cursor.fetchone()
+            if row and row[1] == "assistant":
+                cursor.execute("DELETE FROM messages WHERE id = ?", (row[0],))
+                self.conn.commit()
+                return True
+            return False
+
+    def get_last_user_message(self, chat_id):
+        """Return the most recent user message text in a chat, or None."""
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT content FROM messages WHERE chat_id = ? AND role = 'user' ORDER BY id DESC LIMIT 1",
+                (chat_id,)
+            )
+            row = cursor.fetchone()
+            return row[0] if row else None
+
     def get_chat_history(self, chat_id, limit=50):
         with self.lock:
             cursor = self.conn.cursor()
@@ -676,6 +750,8 @@ class ChatClient:
             "id": model_id,
             "aliases": [model_id],
             "name": model_id,
+            "emoji": "🤖",
+            "provider": "AI",
             "description": "AI Model",
             "tier": "PRO",
             "supports_system_role": supports_sys,
@@ -1108,7 +1184,7 @@ class TelegramBotApp:
     def send_message(self, chat_id, text, reply_markup=None, parse_mode="HTML", reply_to_message_id=None):
         """Send a message to a Telegram user, automatically splitting messages > 4000 chars."""
         if not text:
-            text = "(Empty response)"
+            text = "⚠️ <i>(Empty response)</i>"
 
         chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)]
         last_result = None
@@ -1154,8 +1230,32 @@ class TelegramBotApp:
         if "message is not modified" in desc:
             return res
 
+        # If HTML parse failed during edit, try plain text edit before sending a new message
+        if parse_mode:
+            payload.pop("parse_mode", None)
+            res_plain = self.tg_request("editMessageText", payload)
+            if res_plain.get("ok"):
+                return res_plain
+
         # If message cannot be edited, send a fresh message so the user always sees the update
         return self.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
+
+    def delete_tg_message(self, chat_id, message_id):
+        if not chat_id or not message_id:
+            return
+        return self.tg_request("deleteMessage", {"chat_id": chat_id, "message_id": message_id}, timeout=10)
+
+    def set_message_reaction(self, chat_id, message_id, emoji="⚡"):
+        """Set an emoji reaction on a user's message if supported by the Telegram server."""
+        if not chat_id or not message_id:
+            return
+        payload = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reaction": [{"type": "emoji", "emoji": emoji}],
+            "is_big": False,
+        }
+        return self.tg_request("setMessageReaction", payload, timeout=8)
 
     def answer_callback_query(self, callback_query_id, text=None, show_alert=False):
         payload = {"callback_query_id": callback_query_id, "show_alert": show_alert}
@@ -1175,22 +1275,23 @@ class TelegramBotApp:
 
     def register_commands(self):
         commands = [
-            {"command": "start", "description": "Start bot & open main menu"},
-            {"command": "model", "description": "Switch AI model (GPT-4o, o1, Gemini, Claude, DeepSeek)"},
-            {"command": "clear", "description": "Start a fresh chat conversation"},
-            {"command": "resume", "description": "Resume your most recent chat"},
-            {"command": "history", "description": "View & load recent chats"},
-            {"command": "stats", "description": "Show usage statistics"},
-            {"command": "export", "description": "Export current chat to a text file"},
-            {"command": "system", "description": "Set custom system prompt"},
-            {"command": "admin", "description": "Show admin & session status"},
-            {"command": "debug", "description": "Toggle debug token info"},
-            {"command": "help", "description": "Show all commands & usage"},
+            {"command": "start", "description": "🏠 Open main dashboard & quick controls"},
+            {"command": "model", "description": "🧠 Switch AI model (GPT-4o, o1, Gemini, Claude, DeepSeek)"},
+            {"command": "clear", "description": "🧹 Start a fresh chat conversation"},
+            {"command": "retry", "description": "🔄 Regenerate the last AI response"},
+            {"command": "resume", "description": "⏯️ Resume your most recent chat"},
+            {"command": "history", "description": "📜 View & load recent chats"},
+            {"command": "system", "description": "🎭 Set custom system prompt or AI persona"},
+            {"command": "stats", "description": "📊 Show usage statistics"},
+            {"command": "export", "description": "📤 Export current chat to a text file"},
+            {"command": "admin", "description": "🛡️ Show admin & session status"},
+            {"command": "debug", "description": "🛠️ Toggle debug & token info"},
+            {"command": "help", "description": "❓ Show all commands & tips"},
         ]
         self.tg_request("setMyCommands", {"commands": commands})
 
     # ------------------------------------------------------------------------
-    # UI Keyboards & Formatting
+    # Rich Formatting & UI Keyboards
     # ------------------------------------------------------------------------
 
     @staticmethod
@@ -1204,11 +1305,74 @@ class TelegramBotApp:
             .replace(">", "&gt;")
         )
 
+    @classmethod
+    def format_ai_response_html(cls, text):
+        """
+        Convert AI Markdown responses (fenced code blocks, inline code, bold,
+        headers, and bullet points) into clean, copy-friendly Telegram HTML.
+        Safely escapes all HTML entities first so Telegram never rejects the payload.
+        """
+        if not text:
+            return "⚠️ <i>(Empty response)</i>"
+
+        code_blocks = []
+
+        def save_code_block(match):
+            lang = (match.group(1) or "").strip()
+            code = match.group(2)
+            escaped_code = cls.escape_html(code.strip("\r\n"))
+            if lang:
+                block_html = f"<pre><code class=\"language-{cls.escape_html(lang)}\">{escaped_code}</code></pre>"
+            else:
+                block_html = f"<pre><code>{escaped_code}</code></pre>"
+            idx = len(code_blocks)
+            code_blocks.append(block_html)
+            return f"@@CODEBLOCK_{idx}@@"
+
+        processed = re.sub(r"```([a-zA-Z0-9_+-]*)\n?(.*?)```", save_code_block, str(text), flags=re.DOTALL)
+
+        inline_codes = []
+
+        def save_inline_code(match):
+            code = cls.escape_html(match.group(1))
+            idx = len(inline_codes)
+            inline_codes.append(f"<code>{code}</code>")
+            return f"@@INLINECODE_{idx}@@"
+
+        processed = re.sub(r"`([^`\n]+)`", save_inline_code, processed)
+
+        # Escape remaining plain text
+        processed = cls.escape_html(processed)
+
+        # Convert Markdown headings (### Heading) -> 📌 <b>Heading</b>
+        processed = re.sub(r"(?m)^#{1,6}\s+(.+)$", r"📌 <b>\1</b>", processed)
+
+        # Convert **bold** -> <b>bold</b>
+        processed = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", processed)
+
+        # Convert clean bullet points at start of lines (* or - ) -> •
+        processed = re.sub(r"(?m)^[\*\-]\s+", "• ", processed)
+
+        # Restore inline code and fenced code blocks
+        for idx, html_snip in enumerate(inline_codes):
+            processed = processed.replace(f"@@INLINECODE_{idx}@@", html_snip)
+        for idx, html_snip in enumerate(code_blocks):
+            processed = processed.replace(f"@@CODEBLOCK_{idx}@@", html_snip)
+
+        return processed
+
     def get_model_info_by_id(self, model_id):
         found = resolve_model_choice(model_id, self.config["models"])
         if found:
             return found
-        return {"id": model_id, "name": model_id, "description": "Custom model", "tier": "PRO"}
+        return {
+            "id": model_id,
+            "name": model_id,
+            "emoji": "🤖",
+            "provider": "AI",
+            "description": "Custom model",
+            "tier": "PRO",
+        }
 
     def get_effective_model(self, user_id, chat_id=None):
         state = self.db.get_or_create_user_state(user_id)
@@ -1223,9 +1387,10 @@ class TelegramBotApp:
         row = []
         for key, model in self.config["models"].items():
             is_selected = (model["id"] == current_model_id)
-            prefix = "✅ " if is_selected else f"{key}. "
-            badge = f"[{model['tier']}]"
-            btn_text = f"{prefix}{model['name']} {badge}"
+            emoji = model.get("emoji", "🤖")
+            prefix = "✅ " if is_selected else f"{emoji} "
+            tier_icon = "💎" if model["tier"] == "PRO" else "🆓"
+            btn_text = f"{prefix}{model['name']} {tier_icon}"
             row.append({
                 "text": btn_text,
                 "callback_data": f"model:{model['id']}"
@@ -1239,7 +1404,7 @@ class TelegramBotApp:
         inline_keyboard.append([
             {"text": "🧹 New Chat", "callback_data": "action:clear"},
             {"text": "📜 History", "callback_data": "action:history"},
-            {"text": "📊 Stats", "callback_data": "action:stats"},
+            {"text": "🏠 Home", "callback_data": "action:home"},
         ])
         return {"inline_keyboard": inline_keyboard}
 
@@ -1255,27 +1420,69 @@ class TelegramBotApp:
                     {"text": "⏯️ Resume Last", "callback_data": "action:resume"},
                 ],
                 [
+                    {"text": "🎭 AI Personas", "callback_data": "action:personas"},
                     {"text": "📊 Statistics", "callback_data": "action:stats"},
-                    {"text": "📤 Export Chat", "callback_data": "action:export"},
                 ],
                 [
-                    {"text": "🛡️ Admin Info", "callback_data": "action:admin"},
-                    {"text": "❓ Help", "callback_data": "action:help"},
+                    {"text": "📤 Export Chat", "callback_data": "action:export"},
+                    {"text": "🛡️ Admin Status", "callback_data": "action:admin"},
+                ],
+                [
+                    {"text": "❓ Help & Shortcuts", "callback_data": "action:help"},
                 ],
             ]
         }
 
+    def build_response_keyboard(self, current_model_id):
+        model_info = self.get_model_info_by_id(current_model_id)
+        emoji = model_info.get("emoji", "🤖")
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "🔄 Regenerate", "callback_data": "action:retry"},
+                    {"text": f"{emoji} {model_info['name']} ▾", "callback_data": "action:models"},
+                    {"text": "🧹 New Chat", "callback_data": "action:clear"},
+                ]
+            ]
+        }
+
+    def build_persona_keyboard(self, current_prompt):
+        buttons = []
+        row = []
+        for key, p in self.config.get("personas", {}).items():
+            is_active = (p["prompt"].strip() == (current_prompt or "").strip())
+            mark = "✅ " if is_active else f"{p['emoji']} "
+            row.append({
+                "text": f"{mark}{p['name']}",
+                "callback_data": f"persona:{key}",
+            })
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        buttons.append([
+            {"text": "🧠 Switch Model", "callback_data": "action:models"},
+            {"text": "🏠 Home", "callback_data": "action:home"},
+        ])
+        return {"inline_keyboard": buttons}
+
     def build_history_keyboard(self, chats):
         buttons = []
         for chat_id, model, created_at, first_msg in chats:
+            model_info = self.get_model_info_by_id(model)
+            emoji = model_info.get("emoji", "💬")
             preview = (first_msg[:24] + "...") if first_msg and len(first_msg) > 24 else (first_msg or "Empty chat")
             buttons.append([{
-                "text": f"📂 #{chat_id} ({model}): {preview}",
+                "text": f"📂 #{chat_id} {emoji} {model_info['name']}: {preview}",
                 "callback_data": f"load:{chat_id}"
             }])
         buttons.append([
             {"text": "🧹 Start New Chat", "callback_data": "action:clear"},
             {"text": "🧠 Switch Model", "callback_data": "action:models"},
+        ])
+        buttons.append([
+            {"text": "🏠 Back to Home", "callback_data": "action:home"},
         ])
         return {"inline_keyboard": buttons}
 
@@ -1293,46 +1500,67 @@ class TelegramBotApp:
                 messages.append({"role": role, "content": content})
         return messages
 
-    def handle_start(self, chat_id, user_id, first_name="User"):
+    def handle_start(self, chat_id, user_id, first_name="User", edit_msg_id=None):
         self.awaiting_model_selection.pop(chat_id, None)
         self.awaiting_model_selection.pop(user_id, None)
         state = self.db.get_or_create_user_state(user_id)
         current_model = self.get_effective_model(user_id, chat_id)
         model_info = self.get_model_info_by_id(current_model)
+        emoji = model_info.get("emoji", "🤖")
+        provider = model_info.get("provider", "AI")
         history_count = len(self.db.get_chat_history(state["current_chat_id"]))
 
         text = (
-            f"👋 <b>Welcome, {self.escape_html(first_name)}!</b>\n\n"
-            f"🤖 <b>AI Chat Bot</b> — <i>Admin Mode (All PRO Models Unlocked)</i>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔹 <b>Current Model:</b> <code>{self.escape_html(model_info['name'])}</code> (<code>{self.escape_html(model_info['id'])}</code>)\n"
-            f"🔹 <b>Active Chat ID:</b> <code>#{state['current_chat_id']}</code> ({history_count} messages)\n"
-            f"🔹 <b>Session ID:</b> <code>{state['current_session_id']}</code>\n"
-            f"🔹 <b>Subscription:</b> <code>BYPASSED (UNLIMITED)</code>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💬 <b>Send any message below to start chatting</b>, or tap <b>🧠 Switch AI Model</b> to change models:"
+            f"✨ <b>Welcome, {self.escape_html(first_name)}!</b> 👋\n\n"
+            f"🤖 <b>AI Chat Bot Hub</b> — <i>👑 PRO &amp; Admin Unlocked</i>\n"
+            f"┏━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+            f"┃ {emoji} <b>Model:</b> <code>{self.escape_html(model_info['name'])}</code> ({provider})\n"
+            f"┃ 💬 <b>Active Chat:</b> <code>#{state['current_chat_id']}</code> ({history_count} msgs)\n"
+            f"┃ 🔑 <b>Session ID:</b> <code>{state['current_session_id']}</code>\n"
+            f"┃ 💎 <b>Access Tier:</b> <code>UNLIMITED PRO</code>\n"
+            f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n"
+            f"🚀 <b>How to use:</b>\n"
+            f"• Just <b>send any message</b> below to chat with <b>{self.escape_html(model_info['name'])}</b>!\n"
+            f"• Tap <b>🧠 Switch AI Model</b> to choose between GPT-4o, o1, Gemini 1.5, Claude 3.5 &amp; DeepSeek R1.\n"
+            f"• Tap <b>🎭 AI Personas</b> to customize how the AI responds."
         )
-        self.send_message(chat_id, text, reply_markup=self.build_start_keyboard())
+        kb = self.build_start_keyboard()
+        if edit_msg_id:
+            self.edit_message(chat_id, edit_msg_id, text, reply_markup=kb)
+        else:
+            self.send_message(chat_id, text, reply_markup=kb)
 
-    def handle_help(self, chat_id):
+    def handle_help(self, chat_id, edit_msg_id=None):
         text = (
-            "📚 <b>AVAILABLE COMMANDS</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "• /start - Open main control panel\n"
-            "• /model - Switch AI model (tap a button or type <code>/model 1-9</code>)\n"
-            "• /clear - Start a new empty chat\n"
-            "• /resume - Resume your most recent conversation\n"
-            "• /history - List recent chats &amp; load with 1 tap\n"
-            "• /load <code>&lt;id&gt;</code> - Load a specific chat by ID\n"
-            "• /sessions - View your recent session IDs\n"
-            "• /stats - View total sessions, chats &amp; messages\n"
-            "• /export - Download current chat as a <code>.txt</code> file\n"
-            "• /system <code>&lt;prompt&gt;</code> - Set a custom system prompt\n"
-            "• /debug - Toggle token &amp; debug info on replies\n"
-            "• /admin - View Admin &amp; PRO bypass status\n\n"
-            "💡 <i>Tip: You can also switch models anytime with <code>/model 2</code> (GPT-4o), <code>/model 5</code> (Gemini 1.5 Flash), <code>/model 7</code> (Claude 3.5 Sonnet), or <code>/model 8</code> (DeepSeek R1)!</i>"
+            "📚 <b>COMMAND CENTER &amp; SHORTCUTS</b> ✨\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🏠 <b>Core Controls</b>\n"
+            "• /start — Open interactive main dashboard\n"
+            "• /model — Open AI Model Switcher menu\n"
+            "• /clear — Start a fresh conversation\n"
+            "• /retry — Regenerate the last AI response\n"
+            "• /system — Choose an AI Persona or custom prompt\n\n"
+            "🗂️ <b>History &amp; Tools</b>\n"
+            "• /resume — Jump back into your latest chat\n"
+            "• /history — Browse &amp; load past conversations\n"
+            "• /load <code>&lt;id&gt;</code> — Load a specific chat by ID\n"
+            "• /export — Download chat transcript as <code>.txt</code>\n"
+            "• /stats — View your message &amp; session counters\n"
+            "• /debug — Toggle live response speed &amp; token metrics\n"
+            "• /admin — View Admin &amp; PRO bypass diagnostics\n\n"
+            "⚡ <b>Quick Model Shortcuts</b>\n"
+            "Type <code>/1</code> to <code>/9</code> or <code>/model 2</code> anytime:\n"
+            "<code>/1</code> ⚡ GPT-4o Mini  |  <code>/2</code> 👑 GPT-4o\n"
+            "<code>/3</code> 🧠 GPT-01       |  <code>/4</code> ⚙️ GPT-01 Mini\n"
+            "<code>/5</code> ✨ Gemini 1.5   |  <code>/6</code> 🍃 Claude Haiku\n"
+            "<code>/7</code> 🎭 Claude Sonnet|  <code>/8</code> 🔬 DeepSeek R1\n"
+            "<code>/9</code> 🚀 DeepSeek V3"
         )
-        self.send_message(chat_id, text, reply_markup=self.build_start_keyboard())
+        kb = self.build_start_keyboard()
+        if edit_msg_id:
+            self.edit_message(chat_id, edit_msg_id, text, reply_markup=kb)
+        else:
+            self.send_message(chat_id, text, reply_markup=kb)
 
     def handle_model_menu(self, chat_id, user_id, edit_msg_id=None):
         self.db.get_or_create_user_state(user_id)
@@ -1344,18 +1572,25 @@ class TelegramBotApp:
         self.awaiting_model_selection[user_id] = True
 
         lines = [
-            "🧠 <b>SELECT AI MODEL (ADMIN MODE - PRO UNLOCKED)</b>",
-            "━━━━━━━━━━━━━━━━━━━━━━",
+            "🧠 <b>SELECT YOUR AI ENGINE</b> 👑",
+            "<i>All PRO &amp; Reasoning models are unlocked!</i>",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
         ]
         for key, m in self.config["models"].items():
-            mark = "✅" if m["id"] == current_model else f"[{key}]"
+            is_curr = (m["id"] == current_model)
+            emoji = m.get("emoji", "🤖")
+            status_icon = "✅" if is_curr else f"<b>[{key}]</b>"
+            tier_badge = "💎 PRO" if m["tier"] == "PRO" else "🆓 FREE"
             lines.append(
-                f"{mark} <b>{self.escape_html(m['name'])}</b> (<code>{self.escape_html(m['id'])}</code>)\n"
-                f"    └ <i>{self.escape_html(m['description'])} • {m['tier']}</i>"
+                f"{status_icon} {emoji} <b>{self.escape_html(m['name'])}</b> — <i>{tier_badge}</i>\n"
+                f"     └ <code>{self.escape_html(m['id'])}</code> • {self.escape_html(m['description'])}"
             )
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━")
-        lines.append(f"Current: <b>{self.escape_html(model_info['name'])}</b> (<code>{self.escape_html(model_info['id'])}</code>)")
-        lines.append("<i>Tap a model button below or reply with a number (1–9):</i>")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append(
+            f"🎯 <b>Active Now:</b> {model_info.get('emoji', '🤖')} "
+            f"<b>{self.escape_html(model_info['name'])}</b> (<code>{self.escape_html(model_info['id'])}</code>)"
+        )
+        lines.append("👇 <i>Tap any model button below or reply with 1–9:</i>")
 
         text = "\n".join(lines)
         kb = self.build_model_keyboard(current_model)
@@ -1372,7 +1607,7 @@ class TelegramBotApp:
         if not matched:
             self.send_message(
                 chat_id,
-                "❌ Invalid model selection. Tap a button below or send <code>/model 1</code>–<code>/model 9</code>:",
+                "❌ <b>Unknown model selection.</b>\nTap a model button below or type <code>/model 1</code>–<code>/model 9</code>:",
                 reply_markup=self.build_model_keyboard(self.get_effective_model(user_id, chat_id)),
             )
             return False
@@ -1383,13 +1618,20 @@ class TelegramBotApp:
 
         active_chat_id = self.db.switch_user_model(user_id, chosen_model_id, chat_id_Sync=chat_id)
         model_info = self.get_model_info_by_id(chosen_model_id)
+        emoji = model_info.get("emoji", "🤖")
+        provider = model_info.get("provider", "AI")
+        tier_badge = "💎 PRO UNLOCKED" if model_info["tier"] == "PRO" else "🆓 FREE TIER"
 
         text = (
-            f"✅ <b>Model Switched Successfully!</b>\n\n"
-            f"🤖 <b>Active Model:</b> {self.escape_html(model_info['name'])} (<code>{self.escape_html(model_info['id'])}</code>)\n"
-            f"⚡ <b>Tier:</b> {model_info['tier']} — {self.escape_html(model_info['description'])}\n"
-            f"💬 <b>Chat ID:</b> <code>#{active_chat_id}</code>\n\n"
-            f"Send your message now to chat with <b>{self.escape_html(model_info['name'])}</b>!"
+            f"✅ <b>AI Model Activated!</b> 🎉\n"
+            f"┏━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+            f"┃ {emoji} <b>Model:</b> <b>{self.escape_html(model_info['name'])}</b>\n"
+            f"┃ 🏢 <b>Provider:</b> {self.escape_html(provider)} (<code>{self.escape_html(model_info['id'])}</code>)\n"
+            f"┃ ⚡ <b>Specialty:</b> {self.escape_html(model_info['description'])}\n"
+            f"┃ 🛡️ <b>Tier:</b> {tier_badge}\n"
+            f"┃ 💬 <b>Chat ID:</b> <code>#{active_chat_id}</code>\n"
+            f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n"
+            f"💬 <i>Send a message now to chat with <b>{self.escape_html(model_info['name'])}</b>!</i>"
         )
         kb = self.build_model_keyboard(chosen_model_id)
         if edit_msg_id:
@@ -1413,33 +1655,54 @@ class TelegramBotApp:
         if chat_id != user_id:
             self.db.update_user_state(chat_id, current_chat_id=new_chat_id, current_model=current_model)
         model_info = self.get_model_info_by_id(current_model)
+        emoji = model_info.get("emoji", "🤖")
         self.send_message(
             chat_id,
-            f"🧹 <b>Chat cleared!</b>\nStarted fresh conversation <code>#{new_chat_id}</code> with model <b>{self.escape_html(model_info['name'])}</b> (<code>{self.escape_html(current_model)}</code>)."
+            f"🧹 <b>Fresh Conversation Started!</b> ✨\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💬 <b>New Chat ID:</b> <code>#{new_chat_id}</code>\n"
+            f"{emoji} <b>Active Model:</b> <b>{self.escape_html(model_info['name'])}</b> (<code>{self.escape_html(current_model)}</code>)\n\n"
+            f"🚀 <i>What would you like to explore next?</i>",
+            reply_markup=self.build_start_keyboard(),
         )
 
-    def handle_history(self, chat_id, user_id):
+    def handle_history(self, chat_id, user_id, edit_msg_id=None):
         chats = self.db.get_recent_chats(limit=10, user_id=user_id)
         if not chats:
-            self.send_message(chat_id, "📭 No chat history found yet. Send a message to begin!")
+            self.send_message(
+                chat_id,
+                "📭 <b>No chat history yet!</b>\nSend any message to start your first conversation. 💬",
+                reply_markup=self.build_start_keyboard(),
+            )
             return
 
-        lines = ["📜 <b>RECENT CHATS</b>", "━━━━━━━━━━━━━━━━━━━━━━"]
+        lines = [
+            "📜 <b>YOUR RECENT CONVERSATIONS</b>",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        ]
         for cid, model, created_at, first_msg in chats:
-            preview = (first_msg[:45] + "...") if first_msg and len(first_msg) > 45 else (first_msg or "(No user messages yet)")
+            m_info = self.get_model_info_by_id(model)
+            emoji = m_info.get("emoji", "🤖")
+            preview = (first_msg[:45] + "...") if first_msg and len(first_msg) > 45 else (first_msg or "(No messages yet)")
             lines.append(
-                f"• <b>ID #{cid}</b> | <code>{self.escape_html(model)}</code> | {self.escape_html(created_at)}\n"
-                f"  <i>{self.escape_html(preview)}</i>"
+                f"📂 <b>Chat #{cid}</b> • {emoji} <code>{self.escape_html(m_info['name'])}</code>\n"
+                f"   🕒 <i>{self.escape_html(created_at)}</i>\n"
+                f"   💬 <i>\"{self.escape_html(preview)}\"</i>"
             )
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━\nTap a chat below to load and continue it:")
-        self.send_message(chat_id, "\n".join(lines), reply_markup=self.build_history_keyboard(chats))
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━\n👇 <i>Tap any conversation below to load &amp; continue:</i>")
+        text = "\n".join(lines)
+        kb = self.build_history_keyboard(chats)
+        if edit_msg_id:
+            self.edit_message(chat_id, edit_msg_id, text, reply_markup=kb)
+        else:
+            self.send_message(chat_id, text, reply_markup=kb)
 
     def handle_load_chat(self, chat_id, user_id, target_chat_id):
         chat_info = self.db.get_chat_by_id(target_chat_id, user_id=user_id)
         if not chat_info:
             chat_info = self.db.get_chat_by_id(target_chat_id)
         if not chat_info:
-            self.send_message(chat_id, f"❌ Chat <code>#{target_chat_id}</code> not found.")
+            self.send_message(chat_id, f"❌ <b>Chat <code>#{target_chat_id}</code> was not found.</b>")
             return
 
         cid, model, created_at, sys_prompt = chat_info
@@ -1460,28 +1723,31 @@ class TelegramBotApp:
                 system_prompt=sys_prompt or DEFAULT_SYSTEM_PROMPT
             )
 
+        m_info = self.get_model_info_by_id(model)
+        emoji = m_info.get("emoji", "🤖")
+
         lines = [
-            f"📂 <b>Loaded Chat #{cid}</b>",
-            f"🤖 <b>Model:</b> <code>{self.escape_html(model)}</code> | <b>Messages:</b> {len(history)}",
-            "━━━━━━━━━━━━━━━━━━━━━━",
+            f"📂 <b>Conversation #{cid} Restored!</b> ✨",
+            f"{emoji} <b>Model:</b> <b>{self.escape_html(m_info['name'])}</b> (<code>{self.escape_html(model)}</code>) • 💬 <b>{len(history)} msgs</b>",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
         ]
         if history:
             for role, content in history[-5:]:
-                icon = "👤 You" if role == "user" else "🤖 AI"
-                snippet = (content[:100] + "...") if len(content) > 100 else content
-                lines.append(f"<b>{icon}:</b> {self.escape_html(snippet)}")
+                icon = "👤 <b>You</b>" if role == "user" else f"{emoji} <b>AI</b>"
+                snippet = (content[:110] + "...") if len(content) > 110 else content
+                lines.append(f"{icon}: {self.escape_html(snippet)}")
         else:
-            lines.append("<i>(No messages in this chat yet)</i>")
+            lines.append("<i>(No messages in this conversation yet)</i>")
 
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━\n💬 Send a message to continue this conversation!")
-        self.send_message(chat_id, "\n".join(lines))
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━\n💬 <i>Send a message below to continue right where you left off!</i>")
+        self.send_message(chat_id, "\n".join(lines), reply_markup=self.build_response_keyboard(model))
 
     def handle_resume(self, chat_id, user_id):
         chats = self.db.get_recent_chats(limit=1, user_id=user_id)
         if not chats:
             chats = self.db.get_recent_chats(limit=1)
         if not chats:
-            self.send_message(chat_id, "📭 No previous chats found to resume.")
+            self.send_message(chat_id, "📭 <b>No previous chats found to resume.</b>")
             return
         self.handle_load_chat(chat_id, user_id, chats[0][0])
 
@@ -1490,15 +1756,19 @@ class TelegramBotApp:
         if not sessions:
             sessions = self.db.get_all_sessions()
         if not sessions:
-            self.send_message(chat_id, "📭 No sessions recorded yet.")
+            self.send_message(chat_id, "📭 <b>No sessions recorded yet.</b>")
             return
 
-        lines = ["🗂️ <b>RECENT SESSIONS</b>", "━━━━━━━━━━━━━━━━━━━━━━"]
+        lines = ["🗂️ <b>RECENT SESSIONS</b>", "━━━━━━━━━━━━━━━━━━━━━━━━━━"]
         for sid, model, created, ended in sessions[:15]:
-            lines.append(f"• <code>{self.escape_html(sid)}</code> | <code>{self.escape_html(model)}</code> | {self.escape_html(created)}")
+            m_info = self.get_model_info_by_id(model)
+            lines.append(
+                f"• 🔑 <code>{self.escape_html(sid)}</code> | {m_info.get('emoji', '🤖')} "
+                f"<code>{self.escape_html(model)}</code> | 🕒 {self.escape_html(created)}"
+            )
         self.send_message(chat_id, "\n".join(lines))
 
-    def handle_stats(self, chat_id, user_id):
+    def handle_stats(self, chat_id, user_id, edit_msg_id=None):
         sessions = self.db.get_all_sessions(user_id=user_id)
         recent_chats = self.db.get_recent_chats(limit=100, user_id=user_id)
         total_messages = 0
@@ -1507,65 +1777,91 @@ class TelegramBotApp:
 
         state = self.db.get_or_create_user_state(user_id)
         current_model = self.get_effective_model(user_id, chat_id)
+        m_info = self.get_model_info_by_id(current_model)
         text = (
-            "📊 <b>BOT USAGE STATISTICS</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"• <b>Your Sessions:</b> {len(sessions)}\n"
-            f"• <b>Your Chats:</b> {len(recent_chats)}\n"
-            f"• <b>Total Messages:</b> {total_messages}\n"
-            f"• <b>Active Chat ID:</b> <code>#{state['current_chat_id']}</code>\n"
-            f"• <b>Active Model:</b> <code>{self.escape_html(current_model)}</code>\n"
-            f"• <b>Database:</b> <code>{self.escape_html(self.config['db_path'])}</code>"
+            "📊 <b>YOUR AI USAGE ANALYTICS</b> 📈\n"
+            "┏━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+            f"┃ 🗂️ <b>Total Sessions:</b> <code>{len(sessions)}</code>\n"
+            f"┃ 💬 <b>Total Chats:</b> <code>{len(recent_chats)}</code>\n"
+            f"┃ ✉️ <b>Messages Exchanged:</b> <code>{total_messages}</code>\n"
+            f"┃ 🎯 <b>Active Chat ID:</b> <code>#{state['current_chat_id']}</code>\n"
+            f"┃ {m_info.get('emoji', '🤖')} <b>Current Model:</b> <code>{self.escape_html(m_info['name'])}</code>\n"
+            f"┃ 🗄️ <b>Storage Engine:</b> <code>SQLite ({self.escape_html(self.config['db_path'])})</code>\n"
+            "┗━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
         )
-        self.send_message(chat_id, text)
+        kb = self.build_start_keyboard()
+        if edit_msg_id:
+            self.edit_message(chat_id, edit_msg_id, text, reply_markup=kb)
+        else:
+            self.send_message(chat_id, text, reply_markup=kb)
 
     def handle_export(self, chat_id, user_id):
         state = self.db.get_or_create_user_state(user_id)
         current_model = self.get_effective_model(user_id, chat_id)
         history = self.db.get_chat_history(state["current_chat_id"], limit=1000)
         if not history:
-            self.send_message(chat_id, "📭 No messages in the current chat to export yet.")
+            self.send_message(chat_id, "📭 <b>No messages in the current chat to export yet!</b>")
             return
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"chat_{state['current_chat_id']}_{timestamp}.txt"
 
         buf = [
-            f"Chat Export - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"Chat ID: #{state['current_chat_id']}",
-            f"Model: {current_model}",
-            f"System Prompt: {state['system_prompt']}",
-            "=" * 60,
+            f"============================================================",
+            f"🤖 AI CHAT BOT — CONVERSATION TRANSCRIPT",
+            f"============================================================",
+            f"Exported At   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Chat ID       : #{state['current_chat_id']}",
+            f"Active Model  : {current_model}",
+            f"System Prompt : {state['system_prompt']}",
+            f"Total Messages: {len(history)}",
+            f"============================================================",
             "",
         ]
         for role, content in history:
-            buf.append(f"[{role.upper()}]:\n{content}\n")
+            header = "👤 USER" if role == "user" else f"🤖 ASSISTANT ({current_model})"
+            buf.append(f"{header}:\n{content}\n" + ("-" * 50))
 
         content_bytes = "\n".join(buf).encode("utf-8")
         self.send_document(
             chat_id,
             filename,
             content_bytes,
-            caption=f"📤 Exported Chat #{state['current_chat_id']} ({len(history)} messages)"
+            caption=f"📤 Exported Chat #{state['current_chat_id']} • {len(history)} messages ({current_model}) ✨"
         )
 
-    def handle_system_prompt(self, chat_id, user_id, prompt_text):
+    def handle_system_prompt(self, chat_id, user_id, prompt_text="", edit_msg_id=None):
         state = self.db.get_or_create_user_state(user_id)
         if not prompt_text:
-            self.send_message(
-                chat_id,
-                f"⚙️ <b>Current System Prompt:</b>\n<code>{self.escape_html(state['system_prompt'])}</code>\n\n"
-                f"To update it, send:\n<code>/system You are an expert coding assistant.</code>"
+            text = (
+                "🎭 <b>AI PERSONA &amp; SYSTEM INSTRUCTIONS</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📝 <b>Active System Prompt:</b>\n"
+                f"<blockquote>{self.escape_html(state['system_prompt'])}</blockquote>\n\n"
+                "👇 <b>Tap a preset persona below</b>, or set your own custom instructions anytime with:\n"
+                "<code>/system You are an expert Python &amp; web developer.</code>"
             )
+            kb = self.build_persona_keyboard(state["system_prompt"])
+            if edit_msg_id:
+                self.edit_message(chat_id, edit_msg_id, text, reply_markup=kb)
+            else:
+                self.send_message(chat_id, text, reply_markup=kb)
             return
 
         self.db.update_user_state(user_id, system_prompt=prompt_text)
         if chat_id != user_id:
             self.db.update_user_state(chat_id, system_prompt=prompt_text)
-        self.send_message(
-            chat_id,
-            f"✅ <b>System prompt updated!</b>\n<code>{self.escape_html(prompt_text)}</code>"
+        text = (
+            "✅ <b>System Prompt Updated!</b> 🎭\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<blockquote>{self.escape_html(prompt_text)}</blockquote>\n"
+            "💬 <i>Your active AI model will now follow these instructions!</i>"
         )
+        kb = self.build_persona_keyboard(prompt_text)
+        if edit_msg_id:
+            self.edit_message(chat_id, edit_msg_id, text, reply_markup=kb)
+        else:
+            self.send_message(chat_id, text, reply_markup=kb)
 
     def handle_debug(self, chat_id, user_id):
         state = self.db.get_or_create_user_state(user_id)
@@ -1573,43 +1869,85 @@ class TelegramBotApp:
         self.db.update_user_state(user_id, debug_mode=new_val)
         if chat_id != user_id:
             self.db.update_user_state(chat_id, debug_mode=new_val)
-        status = "ON ✅" if new_val else "OFF ❌"
-        self.send_message(chat_id, f"🛠️ <b>Debug Mode:</b> {status}")
+        status = "ENABLED ✅ (Showing tokens, latency & model metadata)" if new_val else "DISABLED ❌ (Clean compact footers)"
+        self.send_message(chat_id, f"🛠️ <b>Debug Mode:</b> <code>{status}</code>")
 
-    def handle_admin(self, chat_id, user_id):
+    def handle_admin(self, chat_id, user_id, edit_msg_id=None):
         state = self.db.get_or_create_user_state(user_id)
         current_model = self.get_effective_model(user_id, chat_id)
+        m_info = self.get_model_info_by_id(current_model)
         text = (
-            "🛡️ <b>ADMIN &amp; CLIENT INFO</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"• <b>Mode:</b> {'ADMIN' if self.config.get('admin_mode') else 'USER'}\n"
-            f"• <b>Subscription:</b> {'BYPASSED' if self.config.get('bypass_subscription') else 'ACTIVE'}\n"
-            f"• <b>Messages:</b> {'UNLIMITED' if self.config.get('unlimited_messages') else 'LIMITED'}\n"
-            f"• <b>Content Filter:</b> {'DISABLED' if not self.config.get('content_filter_enabled') else 'ENABLED'}\n"
-            f"• <b>Current Model:</b> <code>{self.escape_html(current_model)}</code>\n"
-            f"• <b>Active Chat ID:</b> <code>#{state['current_chat_id']}</code>\n"
-            f"• <b>Session ID:</b> <code>{self.escape_html(state['current_session_id'])}</code>\n"
-            f"• <b>Debug Mode:</b> {'ON' if state['debug_mode'] else 'OFF'}"
+            "🛡️ <b>ADMINISTRATION &amp; SYSTEM DIAGNOSTICS</b> ⚡\n"
+            "┏━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+            f"┃ 👑 <b>Privilege Mode:</b> <code>{'ADMIN UNLOCKED' if self.config.get('admin_mode') else 'STANDARD'}</code>\n"
+            f"┃ 💎 <b>PRO Subscription:</b> <code>{'BYPASSED (ALL 9 MODELS)' if self.config.get('bypass_subscription') else 'STANDARD'}</code>\n"
+            f"┃ ♾️ <b>Message Quota:</b> <code>{'UNLIMITED' if self.config.get('unlimited_messages') else 'LIMITED'}</code>\n"
+            f"┃ 🔓 <b>Content Filter:</b> <code>{'DISABLED' if not self.config.get('content_filter_enabled') else 'ENABLED'}</code>\n"
+            f"┃ {m_info.get('emoji', '🤖')} <b>Active Engine:</b> <code>{self.escape_html(current_model)}</code>\n"
+            f"┃ 💬 <b>Active Chat ID:</b> <code>#{state['current_chat_id']}</code>\n"
+            f"┃ 🔑 <b>Session Token:</b> <code>{self.escape_html(state['current_session_id'])}</code>\n"
+            f"┃ 🛠️ <b>Debug Telemetry:</b> <code>{'ON ✅' if state['debug_mode'] else 'OFF ❌'}</code>\n"
+            "┗━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
         )
-        self.send_message(chat_id, text)
+        kb = self.build_start_keyboard()
+        if edit_msg_id:
+            self.edit_message(chat_id, edit_msg_id, text, reply_markup=kb)
+        else:
+            self.send_message(chat_id, text, reply_markup=kb)
 
-    def handle_user_chat_message(self, chat_id, user_id, text, message_id=None):
+    def handle_retry(self, chat_id, user_id, message_id=None):
+        """Regenerate the last assistant response in the active chat."""
+        state = self.db.get_or_create_user_state(user_id)
+        active_chat_id = state["current_chat_id"]
+        last_user_text = self.db.get_last_user_message(active_chat_id)
+        if not last_user_text:
+            self.send_message(chat_id, "⚠️ <b>No previous message found to regenerate!</b> Send a message first. 💬")
+            return
+
+        # Remove last assistant reply if present so context doesn't duplicate it
+        self.db.delete_last_assistant_message(active_chat_id)
+
+        threading.Thread(
+            target=self.handle_user_chat_message,
+            args=(chat_id, user_id, last_user_text, message_id, True),
+            daemon=True,
+        ).start()
+
+    def handle_user_chat_message(self, chat_id, user_id, text, message_id=None, is_retry=False):
         state = self.db.get_or_create_user_state(user_id)
         active_chat_id = state["current_chat_id"]
         model = self.get_effective_model(user_id, chat_id)
         system_prompt = state["system_prompt"]
+        model_info = self.get_model_info_by_id(model)
+        emoji = model_info.get("emoji", "🤖")
 
         # Keep DB chat model synchronized with the active model
         self.db.update_chat_model(active_chat_id, model)
 
-        # Save user message in SQLite
-        user_msg_row_id = self.db.add_message(active_chat_id, "user", text)
+        # Save user message in SQLite (unless regenerating existing prompt)
+        user_msg_row_id = None
+        if not is_retry:
+            user_msg_row_id = self.db.add_message(active_chat_id, "user", text)
 
         # Build context from history
         messages = self.build_context_messages(active_chat_id, system_prompt)
 
-        # Show typing status in Telegram
+        # React to the user's message and show a live status indicator
+        if message_id and not is_retry:
+            self.set_message_reaction(chat_id, message_id, "⚡")
         self.send_chat_action(chat_id, "typing")
+
+        status_label = "🔄 <b>Regenerating</b>" if is_retry else f"{emoji} <b>{self.escape_html(model_info['name'])}</b> is thinking"
+        placeholder_res = self.send_message(
+            chat_id,
+            f"{status_label}... ⏳💭",
+            reply_to_message_id=message_id,
+        )
+        placeholder_msg_id = None
+        if placeholder_res and placeholder_res.get("ok"):
+            placeholder_msg_id = placeholder_res.get("result", {}).get("message_id")
+
+        start_ts = time.time()
 
         # Call Firebase Cloud Function endpoint with selected model
         response = self.client.send_message(
@@ -1619,31 +1957,50 @@ class TelegramBotApp:
             max_tokens=1000
         )
 
+        elapsed = round(time.time() - start_ts, 1)
+
         if response and response.get("content"):
             assistant_msg = response["content"]
             tokens = response.get("tokens", {}).get("total", 0)
             used_model = model
-            model_info = self.get_model_info_by_id(used_model)
+            used_info = self.get_model_info_by_id(used_model)
+            used_emoji = used_info.get("emoji", "🤖")
 
             self.db.add_message(active_chat_id, "assistant", assistant_msg, tokens)
 
-            reply_text = self.escape_html(assistant_msg)
+            formatted_body = self.format_ai_response_html(assistant_msg)
+            footer_items = [f"{used_emoji} <b>{self.escape_html(used_info['name'])}</b>"]
             if state["debug_mode"]:
-                footer_parts = [f"Model: {model_info['name']} ({used_model})"]
+                footer_items.append(f"⏱️ {elapsed}s")
                 if tokens > 0:
-                    footer_parts.append(f"Tokens: {tokens}")
-                reply_text += f"\n\n<i>[{' | '.join(footer_parts)}]</i>"
+                    footer_items.append(f"🎟️ {tokens} tok")
+                footer_items.append(f"💬 #{active_chat_id}")
+            else:
+                footer_items.append(f"⚡ {elapsed}s")
 
-            self.send_message(chat_id, reply_text, reply_to_message_id=message_id)
+            reply_text = f"{formatted_body}\n\n━━━━━━━━━━━━━━━━━━\n<i>{'  •  '.join(footer_items)}</i>"
+            reply_kb = self.build_response_keyboard(used_model)
+
+            if placeholder_msg_id and len(reply_text) <= 4000:
+                self.edit_message(chat_id, placeholder_msg_id, reply_text, reply_markup=reply_kb)
+            else:
+                if placeholder_msg_id:
+                    self.delete_tg_message(chat_id, placeholder_msg_id)
+                self.send_message(chat_id, reply_text, reply_markup=reply_kb, reply_to_message_id=message_id)
         else:
             # Remove unanswered user message so it does not corrupt alternating user/assistant history
             if user_msg_row_id:
                 self.db.delete_message(user_msg_row_id)
-            self.send_message(
-                chat_id,
-                "⚠️ <b>No response received from AI endpoint.</b> Please try again or switch models with /model.",
-                reply_to_message_id=message_id
+            err_text = (
+                "⚠️ <b>Temporary AI Endpoint Timeout</b> 😔\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "The cloud endpoint didn't return a response in time.\n"
+                "👇 Tap <b>🔄 Regenerate</b> to try again or switch models with <b>🧠 Switch AI Model</b>:"
             )
+            if placeholder_msg_id:
+                self.edit_message(chat_id, placeholder_msg_id, err_text, reply_markup=self.build_response_keyboard(model))
+            else:
+                self.send_message(chat_id, err_text, reply_markup=self.build_response_keyboard(model), reply_to_message_id=message_id)
 
     # ------------------------------------------------------------------------
     # Update Dispatcher & Long-Polling Loop
@@ -1655,6 +2012,7 @@ class TelegramBotApp:
             cb = update["callback_query"]
             cb_id = cb["id"]
             user = cb.get("from", {})
+            first_name = user.get("first_name", "User")
             msg = cb.get("message", {})
             chat_id = msg.get("chat", {}).get("id")
             user_id = user.get("id") or chat_id or 0
@@ -1668,37 +2026,52 @@ class TelegramBotApp:
             if data.startswith("model:"):
                 model_id = data.split(":", 1)[1].strip()
                 matched = resolve_model_choice(model_id, self.config["models"])
-                label = matched["name"] if matched else model_id
-                self.answer_callback_query(cb_id, f"✅ Switched to {label}")
+                label = f"{matched.get('emoji', '🤖')} {matched['name']}" if matched else model_id
+                self.answer_callback_query(cb_id, f"✅ Activated {label}!")
                 self.handle_set_model(chat_id, user_id, model_id, edit_msg_id=msg_id)
+
+            elif data.startswith("persona:"):
+                persona_key = data.split(":", 1)[1].strip()
+                persona = self.config.get("personas", {}).get(persona_key)
+                if persona:
+                    self.answer_callback_query(cb_id, f"🎭 Persona: {persona['name']}")
+                    self.handle_system_prompt(chat_id, user_id, persona["prompt"], edit_msg_id=msg_id)
+                else:
+                    self.answer_callback_query(cb_id, "Unknown persona")
 
             elif data.startswith("load:"):
                 try:
                     target_id = int(data.split(":", 1)[1])
-                    self.answer_callback_query(cb_id, f"Loaded chat #{target_id}")
+                    self.answer_callback_query(cb_id, f"📂 Loaded Chat #{target_id}")
                     self.handle_load_chat(chat_id, user_id, target_id)
                 except ValueError:
-                    self.answer_callback_query(cb_id, "Invalid chat ID")
+                    self.answer_callback_query(cb_id, "❌ Invalid chat ID")
 
             elif data.startswith("action:"):
                 action = data.split(":", 1)[1]
                 self.answer_callback_query(cb_id)
-                if action == "models":
+                if action == "home":
+                    self.handle_start(chat_id, user_id, first_name=first_name, edit_msg_id=msg_id)
+                elif action == "models":
                     self.handle_model_menu(chat_id, user_id, edit_msg_id=msg_id)
+                elif action == "personas":
+                    self.handle_system_prompt(chat_id, user_id, "", edit_msg_id=msg_id)
                 elif action == "clear":
                     self.handle_clear(chat_id, user_id)
+                elif action == "retry":
+                    self.handle_retry(chat_id, user_id)
                 elif action == "history":
-                    self.handle_history(chat_id, user_id)
+                    self.handle_history(chat_id, user_id, edit_msg_id=msg_id)
                 elif action == "resume":
                     self.handle_resume(chat_id, user_id)
                 elif action == "stats":
-                    self.handle_stats(chat_id, user_id)
+                    self.handle_stats(chat_id, user_id, edit_msg_id=msg_id)
                 elif action == "export":
                     self.handle_export(chat_id, user_id)
                 elif action == "admin":
-                    self.handle_admin(chat_id, user_id)
+                    self.handle_admin(chat_id, user_id, edit_msg_id=msg_id)
                 elif action == "help":
-                    self.handle_help(chat_id)
+                    self.handle_help(chat_id, edit_msg_id=msg_id)
             else:
                 self.answer_callback_query(cb_id)
             return
@@ -1742,8 +2115,11 @@ class TelegramBotApp:
                 suffix = command[6:].lstrip("_")
                 self.handle_set_model(chat_id, user_id, suffix)
                 return
-            elif command == "/clear":
+            elif command in ("/clear", "/new"):
                 self.handle_clear(chat_id, user_id)
+                return
+            elif command in ("/retry", "/regenerate"):
+                self.handle_retry(chat_id, user_id, message_id=message_id)
                 return
             elif command == "/resume":
                 self.handle_resume(chat_id, user_id)
@@ -1755,7 +2131,7 @@ class TelegramBotApp:
                 if args.isdigit():
                     self.handle_load_chat(chat_id, user_id, int(args))
                 else:
-                    self.send_message(chat_id, "⚠️ Usage: <code>/load &lt;chat_id&gt;</code>")
+                    self.send_message(chat_id, "⚠️ <b>Usage:</b> <code>/load &lt;chat_id&gt;</code>")
                 return
             elif command == "/sessions":
                 self.handle_sessions(chat_id, user_id)
@@ -1766,7 +2142,7 @@ class TelegramBotApp:
             elif command == "/export":
                 self.handle_export(chat_id, user_id)
                 return
-            elif command == "/system":
+            elif command in ("/system", "/persona"):
                 self.handle_system_prompt(chat_id, user_id, args)
                 return
             elif command == "/debug":
@@ -1781,7 +2157,10 @@ class TelegramBotApp:
                 if matched_shortcut:
                     self.handle_set_model(chat_id, user_id, matched_shortcut["id"])
                     return
-                self.send_message(chat_id, f"❓ Unknown command: <code>{self.escape_html(command)}</code>. Type /help for all commands.")
+                self.send_message(
+                    chat_id,
+                    f"❓ <b>Unknown command:</b> <code>{self.escape_html(command)}</code>\nTap /help to view all commands &amp; shortcuts! ✨",
+                )
                 return
 
         # If the user just opened /model and replied with a number (1-9) or model name, switch the model
@@ -1802,8 +2181,8 @@ class TelegramBotApp:
 
     def run(self):
         print(f"{self.config['colors']['bold']}============================================")
-        print("  AI CHAT BOT - Telegram Bot Mode (Railway)")
-        print("  [ADMIN MODE] All PRO features unlocked")
+        print("  🤖 AI CHAT BOT - Telegram Bot Mode (Railway)")
+        print("  👑 [ADMIN MODE] All PRO features unlocked")
         print(f"============================================{self.config['colors']['reset']}")
 
         me = self.tg_request("getMe")
@@ -1819,7 +2198,7 @@ class TelegramBotApp:
         self.register_commands()
         start_railway_health_server()
 
-        print(f"{self.config['colors']['system']}[*] Polling for Telegram messages...{self.config['colors']['reset']}")
+        print(f"{self.config['colors']['system']}[*] Polling for Telegram messages... ✨{self.config['colors']['reset']}")
 
         while self.running:
             try:
@@ -1875,7 +2254,7 @@ class ChatApp:
             pass
 
     def signal_handler(self, sig, frame):
-        print(f"\n\n{self.config['colors']['system']}[*] Shutting down gracefully...{self.config['colors']['reset']}")
+        print(f"\n\n{self.config['colors']['system']}[*] Shutting down gracefully... 👋{self.config['colors']['reset']}")
         self.running = False
         self.cleanup()
         sys.exit(0)
@@ -1883,30 +2262,31 @@ class ChatApp:
     def print_banner(self):
         banner = f"""
 {self.config['colors']['bold']}============================================
-  AI CHAT BOT - Firebase Chat Client
+  🤖 AI CHAT BOT - Firebase Chat Client
   Reverse Engineered from Android App v1.5.6
-  [ADMIN MODE] All PRO features unlocked
+  👑 [ADMIN MODE] All PRO features unlocked
 ============================================{self.config['colors']['reset']}
 """
         print(banner)
 
     def select_model(self, non_interactive_default=False):
         print(f"\n{self.config['colors']['bold']}{'='*60}")
-        print("  SELECT MODEL (ADMIN MODE - ALL PRO FEATURES UNLOCKED)")
+        print("  🧠 SELECT MODEL (ADMIN MODE - ALL PRO FEATURES UNLOCKED)")
         print(f"{'='*60}{self.config['colors']['reset']}\n")
 
         for key, model in self.config["models"].items():
             tier_color = self.config['colors']['assistant'] if model['tier'] == 'PRO' else self.config['colors']['system']
-            print(f"  {self.config['colors']['bold']}[{key}]{self.config['colors']['reset']} {model['name']} ({model['id']})")
+            emoji = model.get("emoji", "🤖")
+            print(f"  {self.config['colors']['bold']}[{key}]{self.config['colors']['reset']} {emoji} {model['name']} ({model['id']})")
             print(f"      {model['description']} [{tier_color}{model['tier']}{self.config['colors']['reset']}]")
             print()
 
         default_key = "2"
-        print(f"  {self.config['colors']['system']}[default: {default_key} - GPT-4o (Best Model)]{self.config['colors']['reset']}\n")
+        print(f"  {self.config['colors']['system']}[default: {default_key} - 👑 GPT-4o (Best Model)]{self.config['colors']['reset']}\n")
 
         if non_interactive_default or not sys.stdin or not sys.stdin.isatty():
             model = self.config["models"][default_key]
-            print(f"  {self.config['colors']['assistant']}Auto-selected best model: {model['name']} ({model['id']}){self.config['colors']['reset']}")
+            print(f"  {self.config['colors']['assistant']}✅ Auto-selected best model: {model.get('emoji', '👑')} {model['name']} ({model['id']}){self.config['colors']['reset']}")
             return model["id"]
 
         while True:
@@ -1918,9 +2298,9 @@ class ChatApp:
                 choice = default_key
             matched = resolve_model_choice(choice, self.config["models"])
             if matched:
-                print(f"\n  {self.config['colors']['assistant']}Selected: {matched['name']} ({matched['id']}){self.config['colors']['reset']}\n")
+                print(f"\n  {self.config['colors']['assistant']}✅ Selected: {matched.get('emoji', '🤖')} {matched['name']} ({matched['id']}){self.config['colors']['reset']}\n")
                 return matched["id"]
-            print(f"  {self.config['colors']['error']}Invalid choice. Please enter a valid number or model name.{self.config['colors']['reset']}")
+            print(f"  {self.config['colors']['error']}❌ Invalid choice. Please enter a valid number or model name.{self.config['colors']['reset']}")
 
     def cleanup(self):
         if self.db:
@@ -1943,7 +2323,7 @@ class ChatApp:
 
         while self.running:
             try:
-                user_input = input(f"{self.config['colors']['user']}You ({self.current_model}): {self.config['colors']['reset']}").strip()
+                user_input = input(f"{self.config['colors']['user']}👤 You ({self.current_model}): {self.config['colors']['reset']}").strip()
                 if not user_input:
                     continue
                 if user_input.lower() in ["/quit", "/exit", "/q"]:
@@ -1954,7 +2334,7 @@ class ChatApp:
                         matched = resolve_model_choice(parts[1], self.config["models"])
                         if matched:
                             self.current_model = matched["id"]
-                            print(f"\n{self.config['colors']['assistant']}[*] Switched model to: {matched['name']} ({matched['id']}){self.config['colors']['reset']}\n")
+                            print(f"\n{self.config['colors']['assistant']}[*] Switched model to: {matched.get('emoji', '🤖')} {matched['name']} ({matched['id']}){self.config['colors']['reset']}\n")
                         else:
                             print(f"{self.config['colors']['error']}[!] Unknown model: {parts[1]}{self.config['colors']['reset']}")
                     else:
@@ -1965,7 +2345,7 @@ class ChatApp:
                 if user_input.lower() == "/clear":
                     self.current_chat_id = self.db.create_chat(self.current_session_id, self.current_model)
                     self.messages = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}]
-                    print(f"{self.config['colors']['system']}[*] Chat history cleared.{self.config['colors']['reset']}\n")
+                    print(f"{self.config['colors']['system']}[*] 🧹 Chat history cleared.{self.config['colors']['reset']}\n")
                     continue
 
                 self.messages.append({"role": "user", "content": user_input})
@@ -1976,7 +2356,7 @@ class ChatApp:
                     tokens = response.get("tokens", {}).get("total", 0)
                     self.messages.append({"role": "assistant", "content": assistant_msg})
                     self.db.add_message(self.current_chat_id, "assistant", assistant_msg, tokens)
-                    print(f"\n{self.config['colors']['assistant']}Assistant ({self.current_model}): {assistant_msg}{self.config['colors']['reset']}\n")
+                    print(f"\n{self.config['colors']['assistant']}🤖 Assistant ({self.current_model}): {assistant_msg}{self.config['colors']['reset']}\n")
                 else:
                     self.messages.pop()
                     self.db.delete_message(row_id)
@@ -2003,7 +2383,7 @@ def main():
         bot.run()
     else:
         print(
-            f"{CONFIG['colors']['system']}[*] 'API_BOT' environment variable not set — starting in local/preview mode (Default Model: GPT-4o).{CONFIG['colors']['reset']}\n"
+            f"{CONFIG['colors']['system']}[*] 'API_BOT' environment variable not set — starting in local/preview mode (Default Model: 👑 GPT-4o).{CONFIG['colors']['reset']}\n"
             f"{CONFIG['colors']['system']}[*] On Railway, set API_BOT=<your_bot_token> to run as a Telegram Bot.{CONFIG['colors']['reset']}"
         )
         app = ChatApp()
